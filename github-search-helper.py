@@ -90,6 +90,43 @@ def ssh_url(full_name):
     return "git@github.com:%s.git" % full_name
 
 
+def find_ssh_auth_sock():
+    """The shell process rarely inherits SSH_AUTH_SOCK, so ssh-based git
+    clones fail without it. Probe the usual agent locations: the current
+    env, a keychain env file, then well-known sockets."""
+    candidate = os.environ.get("SSH_AUTH_SOCK", "")
+    if candidate and os.path.exists(candidate):
+        return candidate
+
+    import socket as _socket  # local import keeps module surface small
+    keychain_file = os.path.join(HOME, ".keychain", _socket.gethostname() + "-sh")
+    try:
+        with open(keychain_file, encoding="utf-8") as fh:
+            match = re.search(r"SSH_AUTH_SOCK=([^;\s]+)", fh.read())
+        if match and os.path.exists(match.group(1)):
+            return match.group(1)
+    except OSError:
+        pass
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    for candidate in (
+        os.path.join(runtime, "ssh-agent.socket"),
+        os.path.join(runtime, "keyring", "ssh"),
+        os.path.join(HOME, ".1password", "agent.sock"),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def git_env():
+    env = dict(os.environ)
+    sock = find_ssh_auth_sock()
+    if sock:
+        env["SSH_AUTH_SOCK"] = sock
+    return env
+
+
 def normalize(rows):
     out = []
     for row in rows if isinstance(rows, list) else []:
@@ -241,23 +278,38 @@ def notify(summary, urgent=False):
     subprocess.Popen(cmd + ["GitHub", summary], start_new_session=True)
 
 
+def run_clone(source, dest, env):
+    try:
+        proc = subprocess.run(
+            [gh_binary(), "repo", "clone", source, dest],
+            capture_output=True, text=True, timeout=600, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "gh could not be started or timed out"
+    if proc.returncode == 0:
+        return True, ""
+    detail = (proc.stderr or "").strip().splitlines()
+    return False, detail[-1] if detail else "unknown error"
+
+
 def clone(full_name):
     dest = os.path.join(clone_root(), full_name.split("/")[-1])
     if os.path.exists(dest):
         notify("Already cloned: " + dest)
         return
-    try:
-        proc = subprocess.run(
-            [gh_binary(), "repo", "clone", full_name, dest],
-            capture_output=True, timeout=600,
-        )
-        ok = proc.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        ok = False
+    env = git_env()
+    ok, detail = run_clone(full_name, dest, env)
+    if not ok and not os.path.exists(dest):
+        # gh defaults to the user's git protocol (often ssh). Without a
+        # reachable ssh agent that fails, while https works through gh's
+        # own token, so retry once over https.
+        ok, https_detail = run_clone("https://github.com/%s.git" % full_name, dest, env)
+        if not ok:
+            detail = https_detail or detail
     if ok:
         notify("Cloned %s into %s" % (full_name, dest))
     else:
-        notify("Clone failed: " + full_name, urgent=True)
+        notify("Clone failed: %s — %s" % (full_name, detail), urgent=True)
 
 
 def copy_ssh(full_name):

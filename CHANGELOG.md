@@ -3,6 +3,16 @@
 All notable changes to this plugin are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.1.1 — 2026-08-14
+
+### Fixed
+- Cloning failed when `gh` was configured for SSH git operations: the shell
+  process does not inherit `SSH_AUTH_SOCK`, so git could not reach the SSH
+  agent. The helper now discovers the agent socket (current env, keychain
+  env file, systemd/gnome-keyring/1Password sockets) and, if SSH still
+  fails, retries the clone over HTTPS using gh's own token
+- Clone failure notifications now include git's actual error message
+
 ## 1.1.0 — 2026-08-14
 
 ### Added
