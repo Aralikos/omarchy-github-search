@@ -5,13 +5,16 @@ The QML overlay is a thin view; every decision lives here. Communication is
 JSON-lines over stdin/stdout:
 
   stdin  <- {"cmd": "filter", "query": "..."}
-  stdin  <- {"cmd": "refresh"}
+  stdin  <- {"cmd": "refresh", "force": true|false}
   stdin  <- {"cmd": "open", "url": "https://..."}
   stdin  <- {"cmd": "clone", "name": "owner/repo"}
+  stdin  <- {"cmd": "copy", "name": "owner/repo"}
 
   stdout -> {"event": "config", "cloneRoot": "/home/user/Development/github"}
-  stdout -> {"event": "status", "refreshing": true|false, "count": N}
-  stdout -> {"event": "rows", "query": "...", "rows": [{name, desc, url, priv}]}
+  stdout -> {"event": "status", "refreshing": bool, "count": N, "error": ""}
+  stdout -> {"event": "rows", "query": "...", "rows": [{name, desc, url, priv, cloned}]}
+
+Status errors: "" (none), "gh-missing", "gh-auth", "fetch-failed".
 
 The helper exits when stdin closes, so it never outlives the shell overlay.
 Only the Python standard library is used.
@@ -25,11 +28,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 HOME = os.path.expanduser("~")
 CACHE_FILE = os.path.join(HOME, ".cache", "omarchy-github-search", "repos.json")
 CONFIG_FILE = os.path.join(HOME, ".config", "omarchy", "github-search.json")
 DEFAULT_CLONE_ROOT = os.path.join(HOME, "Development", "github")
+DEFAULT_REFRESH_MINUTES = 15
 GH_FIELDS = "{name: .full_name, desc: .description, url: .html_url, private: .private}"
 GH_ENDPOINT = "user/repos?per_page=100&affiliation=owner,organization_member,collaborator"
 MAX_ROWS = 200
@@ -38,6 +43,7 @@ _write_lock = threading.Lock()
 _state_lock = threading.Lock()
 _repos = []
 _last_query = ""
+_last_error = ""
 
 
 def emit(payload):
@@ -50,15 +56,38 @@ def gh_binary():
     return shutil.which("gh") or os.path.join(HOME, ".local", "share", "mise", "shims", "gh")
 
 
-def clone_root():
+def load_config():
     try:
         with open(CONFIG_FILE, encoding="utf-8") as fh:
-            configured = json.load(fh).get("cloneRoot", "")
-        if isinstance(configured, str) and configured:
-            return os.path.expanduser(configured).rstrip("/")
+            return json.load(fh)
     except (OSError, ValueError):
-        pass
+        return {}
+
+
+def clone_root():
+    configured = load_config().get("cloneRoot", "")
+    if isinstance(configured, str) and configured:
+        return os.path.expanduser(configured).rstrip("/")
     return DEFAULT_CLONE_ROOT
+
+
+def refresh_minutes():
+    configured = load_config().get("refreshMinutes", None)
+    if isinstance(configured, (int, float)) and configured >= 0:
+        return float(configured)
+    return float(DEFAULT_REFRESH_MINUTES)
+
+
+def cache_is_fresh():
+    try:
+        age = time.time() - os.path.getmtime(CACHE_FILE)
+    except OSError:
+        return False
+    return age < refresh_minutes() * 60
+
+
+def ssh_url(full_name):
+    return "git@github.com:%s.git" % full_name
 
 
 def normalize(rows):
@@ -101,17 +130,27 @@ def save_cache(rows):
             pass
 
 
+def classify_fetch_error(stderr):
+    text = str(stderr or "").lower()
+    if "auth login" in text or "not logged in" in text or "401" in text:
+        return "gh-auth"
+    return "fetch-failed"
+
+
 def fetch_repos():
-    """One row of NDJSON per repo from gh; a failed fetch returns None."""
+    """Returns (rows, error). One row of NDJSON per repo from gh."""
+    gh = gh_binary()
+    if not os.path.exists(gh):
+        return None, "gh-missing"
     try:
         proc = subprocess.run(
-            [gh_binary(), "api", GH_ENDPOINT, "--paginate", "--jq", ".[] | " + GH_FIELDS],
+            [gh, "api", GH_ENDPOINT, "--paginate", "--jq", ".[] | " + GH_FIELDS],
             capture_output=True, text=True, timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return None, "fetch-failed"
     if proc.returncode != 0:
-        return None
+        return None, classify_fetch_error(proc.stderr)
     rows = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -121,7 +160,10 @@ def fetch_repos():
             rows.append(json.loads(line))
         except ValueError:
             continue
-    return normalize(rows) if rows else None
+    normalized = normalize(rows)
+    if not normalized:
+        return None, "fetch-failed"
+    return normalized, ""
 
 
 def filter_repos(repos, query):
@@ -153,21 +195,43 @@ def filter_repos(repos, query):
     return [item for _, _, item in scored[:MAX_ROWS]]
 
 
+def cloned_dirs():
+    try:
+        return set(os.listdir(clone_root()))
+    except OSError:
+        return set()
+
+
 def emit_rows(query):
     with _state_lock:
         repos = list(_repos)
-    emit({"event": "rows", "query": query, "rows": filter_repos(repos, query)})
+    have = cloned_dirs()
+    rows = []
+    for item in filter_repos(repos, query):
+        row = dict(item)
+        row["cloned"] = item["name"].split("/")[-1] in have
+        rows.append(row)
+    emit({"event": "rows", "query": query, "rows": rows})
 
 
-def refresh():
-    emit({"event": "status", "refreshing": True, "count": len(_repos)})
-    rows = fetch_repos()
+def emit_status(refreshing):
+    emit({"event": "status", "refreshing": refreshing, "count": len(_repos), "error": _last_error})
+
+
+def refresh(force=False):
+    global _last_error
+    if not force and _repos and cache_is_fresh():
+        emit_status(False)
+        return
+    emit_status(True)
+    rows, error = fetch_repos()
+    _last_error = error
     if rows is not None:
         save_cache(rows)
         with _state_lock:
             _repos[:] = rows
         emit_rows(_last_query)
-    emit({"event": "status", "refreshing": False, "count": len(_repos)})
+    emit_status(False)
 
 
 def notify(summary, urgent=False):
@@ -196,9 +260,22 @@ def clone(full_name):
         notify("Clone failed: " + full_name, urgent=True)
 
 
+def copy_ssh(full_name):
+    url = ssh_url(full_name)
+    try:
+        subprocess.run(["wl-copy", url], timeout=10)
+        notify("Copied " + url)
+    except (OSError, subprocess.TimeoutExpired):
+        notify("Copy failed", urgent=True)
+
+
 def open_url(url):
     if url.startswith("https://") or url.startswith("http://"):
         subprocess.Popen(["xdg-open", url], start_new_session=True)
+
+
+def valid_repo_name(name):
+    return bool(re.fullmatch(r"[\w.-]+/[\w.-]+", name))
 
 
 def spawn(target, *args):
@@ -226,13 +303,17 @@ def main():
             _last_query = str(msg.get("query") or "")
             emit_rows(_last_query)
         elif cmd == "refresh":
-            spawn(refresh)
+            spawn(refresh, msg.get("force") is True)
         elif cmd == "open":
             open_url(str(msg.get("url") or ""))
         elif cmd == "clone":
             name = str(msg.get("name") or "")
-            if re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+            if valid_repo_name(name):
                 spawn(clone, name)
+        elif cmd == "copy":
+            name = str(msg.get("name") or "")
+            if valid_repo_name(name):
+                spawn(copy_ssh, name)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ Item {
   property bool cursorActive: false
   property bool refreshing: false
   property bool everLoaded: false
+  property string lastError: ""
   property string cloneRoot: homePath + "/Development/github"
 
   readonly property string pluginDir: (manifest && manifest.__sourceDir)
@@ -54,7 +55,7 @@ Item {
     root.cursorActive = true
     if (helperProc.running) {
       root.send({ cmd: "filter", query: "" })
-      root.send({ cmd: "refresh" })
+      root.send({ cmd: "refresh", force: false })
     } else {
       // A fresh helper emits config, cached rows, and a refresh on its own.
       helperProc.running = true
@@ -96,6 +97,7 @@ Item {
     } else if (msg.event === "status") {
       root.refreshing = msg.refreshing === true
       root.everLoaded = root.everLoaded || msg.count > 0
+      root.lastError = msg.error || ""
     } else if (msg.event === "config") {
       root.cloneRoot = msg.cloneRoot || root.cloneRoot
     }
@@ -128,12 +130,22 @@ Item {
     root.send({ cmd: "filter", query: nextFilter })
   }
 
-  function activateIndex(index, cloneRequested) {
+  // Actions: "open" (browser), "pulls" (PR page), "clone", "copy" (SSH URL).
+  // Copy keeps the overlay up so you can grab several URLs in a row.
+  function activateIndex(index, action) {
     if (index < 0 || index >= displayModel.count) return
     var row = displayModel.get(index)
-    if (cloneRequested) root.send({ cmd: "clone", name: row.name })
+    if (action === "clone") root.send({ cmd: "clone", name: row.name })
+    else if (action === "copy") { root.send({ cmd: "copy", name: row.name }); return }
+    else if (action === "pulls") root.send({ cmd: "open", url: row.url + "/pulls" })
     else root.send({ cmd: "open", url: row.url })
     root.dismiss()
+  }
+
+  function enterAction(modifiers) {
+    if (modifiers & Qt.ControlModifier) return "clone"
+    if (modifiers & Qt.AltModifier) return "pulls"
+    return "open"
   }
 
   ListModel { id: displayModel }
@@ -209,11 +221,14 @@ Item {
           } else if (event.key === Qt.Key_PageDown) {
             root.selectPage(1)
             event.accepted = true
-          } else if (event.key === Qt.Key_F5) {
-            root.send({ cmd: "refresh" })
+          } else if (event.key === Qt.Key_R && event.modifiers === Qt.ControlModifier) {
+            root.send({ cmd: "refresh", force: true })
+            event.accepted = true
+          } else if (event.key === Qt.Key_Y && event.modifiers === Qt.ControlModifier) {
+            if (root.cursorActive) root.activateIndex(root.selectedIndex, "copy")
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-            if (root.cursorActive) root.activateIndex(root.selectedIndex, (event.modifiers & Qt.ControlModifier) !== 0)
+            if (root.cursorActive) root.activateIndex(root.selectedIndex, root.enterAction(event.modifiers))
             else if (displayModel.count > 0) root.cursorActive = true
             event.accepted = true
           } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
@@ -279,6 +294,7 @@ Item {
               required property string desc
               required property string url
               required property bool priv
+              required property bool cloned
 
               readonly property bool hasCursor: root.cursorActive && index === root.selectedIndex
 
@@ -287,9 +303,22 @@ Item {
               radius: root.cornerRadius
               color: hasCursor ? root.selectedBackground : "transparent"
 
+              Text {
+                id: clonedBadge
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.rowPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                visible: cloned
+                text: "\uf07b"
+                color: hasCursor ? root.selectedText : root.foreground
+                opacity: 0.5
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
               Column {
                 anchors.left: parent.left
-                anchors.right: parent.right
+                anchors.right: clonedBadge.visible ? clonedBadge.left : parent.right
                 anchors.leftMargin: Style.spacing.rowPaddingX
                 anchors.rightMargin: Style.spacing.rowPaddingX
                 anchors.verticalCenter: parent.verticalCenter
@@ -327,7 +356,7 @@ Item {
                 onClicked: function(mouse) {
                   root.cursorActive = true
                   root.selectedIndex = index
-                  root.activateIndex(index, (mouse.modifiers & Qt.ControlModifier) !== 0)
+                  root.activateIndex(index, root.enterAction(mouse.modifiers))
                 }
               }
             }
@@ -349,16 +378,20 @@ Item {
             }
 
             Text {
-              text: root.refreshing && !root.everLoaded
-                ? "Loading repositories…"
-                : (!root.everLoaded
-                  ? "No repositories loaded — is `gh` authenticated?"
-                  : "No matches for “" + root.filterText + "”")
+              text: {
+                if (root.refreshing && !root.everLoaded) return "Loading repositories…"
+                if (root.everLoaded) return "No matches for “" + root.filterText + "”"
+                if (root.lastError === "gh-missing") return "GitHub CLI not found — install it with: omarchy pkg add github-cli"
+                if (root.lastError === "gh-auth") return "Not authenticated — run: gh auth login"
+                if (root.lastError === "fetch-failed") return "Fetch failed — check your network, then press ⌃R to retry"
+                return "No repositories loaded — press ⌃R to fetch"
+              }
               color: root.foreground
               opacity: 0.7
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.WordWrap
               width: parent.width
             }
           }
@@ -367,7 +400,7 @@ Item {
         Text {
           width: parent.width
           height: root.footerHeight
-          text: "↵ open in browser · ⌃↵ clone to " + root.cloneRoot.replace(root.homePath, "~") + " · F5 refresh"
+          text: "↵ open · ⌥↵ PRs · ⌃↵ clone → " + root.cloneRoot.replace(root.homePath, "~") + " · ⌃Y SSH · ⌃R refresh"
           color: root.foreground
           opacity: 0.45
           font.family: root.fontFamily
