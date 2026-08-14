@@ -4,8 +4,10 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
-import "RepoSearch.js" as RepoSearch
 
+// Thin view over github-search-helper.py: the Python coprocess owns fetching,
+// caching, filtering, ranking, cloning, and config. This file only renders
+// rows and forwards key presses as JSON-lines commands.
 Item {
   id: root
 
@@ -18,37 +20,13 @@ Item {
   property string filterText: ""
   property int selectedIndex: 0
   property bool cursorActive: false
-  property var repos: []
   property bool refreshing: false
   property bool everLoaded: false
-
-  readonly property string cacheFile: homePath + "/.cache/omarchy-github-search/repos.json"
-  readonly property string configFile: homePath + "/.config/omarchy/github-search.json"
   property string cloneRoot: homePath + "/Development/github"
 
-  function loadConfig(raw) {
-    try {
-      var cfg = JSON.parse(String(raw || ""))
-      if (cfg && typeof cfg.cloneRoot === "string" && cfg.cloneRoot) {
-        var dir = cfg.cloneRoot.replace(/^~(?=\/|$)/, root.homePath)
-        root.cloneRoot = dir.replace(/\/+$/, "")
-      }
-    } catch (e) { }
-  }
-
-  // Fetches owner + org + collaborator repos as NDJSON rows, slurps them into
-  // one array, and atomically replaces the cache so a failed fetch never
-  // clobbers a good one. Output is the fresh JSON for immediate display.
-  readonly property string fetchScript:
-    "set -o pipefail; " +
-    "gh_bin=$(command -v gh || echo \"$HOME/.local/share/mise/shims/gh\"); " +
-    "cache=\"$HOME/.cache/omarchy-github-search/repos.json\"; " +
-    "mkdir -p \"$(dirname \"$cache\")\"; " +
-    "tmp=$(mktemp); " +
-    "if \"$gh_bin\" api 'user/repos?per_page=100&affiliation=owner,organization_member,collaborator' --paginate " +
-    "--jq '.[] | {name: .full_name, desc: .description, url: .html_url, ssh: .ssh_url, private: .private}' " +
-    "| jq -s . > \"$tmp\" 2>/dev/null && [ -s \"$tmp\" ]; then mv \"$tmp\" \"$cache\"; cat \"$cache\"; " +
-    "else rm -f \"$tmp\"; fi"
+  readonly property string pluginDir: (manifest && manifest.__sourceDir)
+    ? manifest.__sourceDir
+    : homePath + "/.config/omarchy/plugins/emiifont.github-search"
 
   // Shares the [menu] surface tokens — themes that style the menu also
   // style this overlay.
@@ -74,9 +52,13 @@ Item {
     root.filterText = ""
     root.selectedIndex = 0
     root.cursorActive = true
-    if (!root.everLoaded) cacheProc.running = true
-    root.refresh()
-    root.rebuildDisplay()
+    if (helperProc.running) {
+      root.send({ cmd: "filter", query: "" })
+      root.send({ cmd: "refresh" })
+    } else {
+      // A fresh helper emits config, cached rows, and a refresh on its own.
+      helperProc.running = true
+    }
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -95,43 +77,28 @@ Item {
     else root.open("{}")
   }
 
-  function refresh() {
-    if (refreshProc.running) return
-    root.refreshing = true
-    refreshProc.running = true
+  function send(payload) {
+    if (helperProc.running) helperProc.write(JSON.stringify(payload) + "\n")
   }
 
-  function loadRepos(raw) {
-    var parsed = RepoSearch.parseRepos(raw)
-    if (parsed.length === 0 && root.repos.length > 0) return
-    root.repos = parsed
-    if (parsed.length > 0) root.everLoaded = true
-    if (root.opened) root.rebuildDisplay()
-  }
-
-  function rebuildDisplay() {
-    var out = RepoSearch.filterRepos(root.repos, root.filterText, 200)
-
-    displayModel.clear()
-    for (var j = 0; j < out.length; j++) {
-      displayModel.append({
-        name: out[j].name,
-        desc: out[j].desc,
-        url: out[j].url,
-        ssh: out[j].ssh,
-        priv: out[j].priv,
-        index: j
+  function handleEvent(msg) {
+    if (msg.event === "rows") {
+      if (msg.query !== root.filterText) return // stale response
+      displayModel.clear()
+      for (var i = 0; i < msg.rows.length; i++) displayModel.append(msg.rows[i])
+      root.everLoaded = root.everLoaded || msg.rows.length > 0
+      if (displayModel.count === 0) root.selectedIndex = 0
+      else if (root.selectedIndex >= displayModel.count) root.selectedIndex = displayModel.count - 1
+      root.cursorActive = displayModel.count > 0
+      Qt.callLater(function() {
+        if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
       })
+    } else if (msg.event === "status") {
+      root.refreshing = msg.refreshing === true
+      root.everLoaded = root.everLoaded || msg.count > 0
+    } else if (msg.event === "config") {
+      root.cloneRoot = msg.cloneRoot || root.cloneRoot
     }
-
-    if (displayModel.count === 0) selectedIndex = 0
-    else if (selectedIndex >= displayModel.count) selectedIndex = displayModel.count - 1
-    else if (selectedIndex < 0) selectedIndex = 0
-    cursorActive = displayModel.count > 0
-
-    Qt.callLater(function() {
-      if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
-    })
   }
 
   function select(delta) {
@@ -147,17 +114,10 @@ Item {
 
   function selectPage(delta) {
     if (displayModel.count === 0) return
-    if (!cursorActive) {
-      cursorActive = true
-      selectedIndex = delta < 0 ? displayModel.count - 1 : 0
-      resultList.positionViewAtIndex(selectedIndex, ListView.Contain)
-      return
-    }
     var visibleRows = Math.max(1, Math.floor(resultList.height / root.rowHeight))
-    var newIndex = selectedIndex + delta * visibleRows
-    if (newIndex < 0) newIndex = 0
-    if (newIndex >= displayModel.count) newIndex = displayModel.count - 1
-    selectedIndex = newIndex
+    var newIndex = cursorActive ? selectedIndex + delta * visibleRows : (delta < 0 ? displayModel.count - 1 : 0)
+    cursorActive = true
+    selectedIndex = Math.max(0, Math.min(displayModel.count - 1, newIndex))
     resultList.positionViewAtIndex(selectedIndex, ListView.Contain)
   }
 
@@ -165,59 +125,29 @@ Item {
     root.filterText = nextFilter
     root.selectedIndex = 0
     root.cursorActive = true
-    root.rebuildDisplay()
+    root.send({ cmd: "filter", query: nextFilter })
   }
 
   function activateIndex(index, cloneRequested) {
     if (index < 0 || index >= displayModel.count) return
     var row = displayModel.get(index)
-    if (cloneRequested) root.cloneRepo(row.name, row.url)
-    else root.openRepo(row.url)
-  }
-
-  function openRepo(url) {
-    if (!url) return
+    if (cloneRequested) root.send({ cmd: "clone", name: row.name })
+    else root.send({ cmd: "open", url: row.url })
     root.dismiss()
-    Quickshell.execDetached(["xdg-open", url])
-  }
-
-  function cloneRepo(fullName, url) {
-    if (!fullName) return
-    root.dismiss()
-    var repoDir = root.cloneRoot + "/" + fullName.split("/").pop()
-    var script =
-      "gh_bin=$(command -v gh || echo \"$HOME/.local/share/mise/shims/gh\"); " +
-      "dest=" + Util.shellQuote(repoDir) + "; " +
-      "name=" + Util.shellQuote(fullName) + "; " +
-      "if [ -e \"$dest\" ]; then notify-send 'GitHub' \"Already cloned: $dest\"; " +
-      "elif \"$gh_bin\" repo clone \"$name\" \"$dest\" >/dev/null 2>&1; then notify-send 'GitHub' \"Cloned $name into $dest\"; " +
-      "else notify-send -u critical 'GitHub' \"Clone failed: $name\"; fi"
-    Quickshell.execDetached(["bash", "-lc", script])
   }
 
   ListModel { id: displayModel }
 
-  FileView {
-    path: root.configFile
-    onLoaded: root.loadConfig(text())
-  }
-
   Process {
-    id: cacheProc
-    command: ["bash", "-c", "cat \"$HOME/.cache/omarchy-github-search/repos.json\" 2>/dev/null || true"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.loadRepos(text)
-    }
-  }
-
-  Process {
-    id: refreshProc
-    command: ["bash", "-lc", root.fetchScript]
-    onExited: root.refreshing = false
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.loadRepos(text)
+    id: helperProc
+    command: ["setpriv", "--pdeathsig", "TERM", "python3", root.pluginDir + "/github-search-helper.py"]
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(data) {
+        try {
+          root.handleEvent(JSON.parse(data))
+        } catch (e) { }
+      }
     }
   }
 
@@ -280,7 +210,7 @@ Item {
             root.selectPage(1)
             event.accepted = true
           } else if (event.key === Qt.Key_F5) {
-            root.refresh()
+            root.send({ cmd: "refresh" })
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             if (root.cursorActive) root.activateIndex(root.selectedIndex, (event.modifiers & Qt.ControlModifier) !== 0)
@@ -409,7 +339,7 @@ Item {
             visible: displayModel.count === 0
 
             Text {
-              text: root.refreshing && root.repos.length === 0 ? "󰑓" : "\uf09b"
+              text: root.refreshing && !root.everLoaded ? "󰑓" : "\uf09b"
               color: root.selectedText
               opacity: 0.8
               font.family: root.fontFamily
@@ -419,9 +349,9 @@ Item {
             }
 
             Text {
-              text: root.refreshing && root.repos.length === 0
+              text: root.refreshing && !root.everLoaded
                 ? "Loading repositories…"
-                : (root.repos.length === 0
+                : (!root.everLoaded
                   ? "No repositories loaded — is `gh` authenticated?"
                   : "No matches for “" + root.filterText + "”")
               color: root.foreground

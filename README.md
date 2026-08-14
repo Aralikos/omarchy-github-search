@@ -25,8 +25,8 @@ keyboard.
 - Omarchy with the Quickshell-based shell (`omarchy-shell`)
 - [`gh`](https://cli.github.com/) — authenticated (`gh auth login`); all
   GitHub access happens through your own `gh` credentials
-- `jq`, `bash`, `notify-send`, `xdg-open` (all present on a stock Omarchy
-  install; only `gh` usually needs installing)
+- `python3`, `bash`, `notify-send`, `xdg-open` (all preinstalled on a stock
+  Omarchy install; only `gh` usually needs installing)
 
 ## Install
 
@@ -73,22 +73,36 @@ Optional. Create `~/.config/omarchy/github-search.json`:
 
 ## How it works
 
-On open, the plugin runs
-`gh api user/repos?affiliation=owner,organization_member,collaborator`
-(paginated) in the background, caches the result at
-`~/.cache/omarchy-github-search/repos.json`, and serves the cache instantly
-on subsequent opens. Filtering is local, so nothing hits the network per
-keystroke. Cloning shells out to `gh repo clone` detached from the shell
-process.
+The QML overlay is a thin view; all logic lives in `github-search-helper.py`,
+a Python coprocess (standard library only) that the overlay starts on first
+open and talks to over a JSON-lines stdin/stdout protocol:
+
+```
+GithubSearch.qml (view)                github-search-helper.py (logic)
+  {"cmd":"filter","query":"..."}  ──►  fuzzy-filter + rank cached repos
+  {"cmd":"refresh"}               ──►  gh api user/repos (paginated)
+  {"cmd":"open","url":"..."}      ──►  xdg-open
+  {"cmd":"clone","name":"o/r"}    ──►  gh repo clone + notify-send
+  rows / status / config lines    ◄──  responses as JSON lines
+```
+
+On start the helper serves the cache at
+`~/.cache/omarchy-github-search/repos.json` instantly, then refreshes it in
+the background from
+`gh api user/repos?affiliation=owner,organization_member,collaborator`.
+Filtering is local, so nothing hits the network per keystroke. The helper
+exits when the shell closes its stdin, and is additionally bound to the
+shell's lifetime via `setpriv --pdeathsig`.
 
 ## Security
 
 Omarchy shell plugins run unsandboxed inside your long-lived `omarchy-shell`
-process with your user permissions. This plugin executes exactly three kinds
-of external commands: the `gh api` fetch described above, `gh repo clone`
-when you press Ctrl+Enter, and `xdg-open`/`notify-send` for opening and
-notifications. It never sends your data anywhere; review the source — it is
-three small files.
+process with your user permissions. This plugin executes exactly four kinds
+of external commands, all from the Python helper: the `gh api` fetch
+described above, `gh repo clone` when you press Ctrl+Enter, and
+`xdg-open`/`notify-send` for opening and notifications. It never sends your
+data anywhere; review the source — it is three small files, and everything
+that makes a decision is in `github-search-helper.py`.
 
 ## License
 
