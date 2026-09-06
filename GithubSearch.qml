@@ -8,6 +8,11 @@ import qs.Ui
 // Thin view over github-search-helper.py: the Python coprocess owns fetching,
 // caching, filtering, ranking, cloning, and config. This file only renders
 // rows and forwards key presses as JSON-lines commands.
+//
+// LOCAL PATCH (Knowledge_OS, 2026-09-06): cloneRoot is ~/Work, a parent of
+// project directories, so Ctrl+Enter opens a destination picker over its
+// subdirectories instead of cloning straight into the root. Reverted by
+// `omarchy plugin update` — see APPARATUS/configs/omarchy-github-search.md.
 Item {
   id: root
 
@@ -24,6 +29,11 @@ Item {
   property bool everLoaded: false
   property string lastError: ""
   property string cloneRoot: homePath + "/Development/github"
+  // Destination picker (local patch)
+  property var targets: []
+  property bool picking: false
+  property int pickIndex: 0
+  property int pendingIndex: -1
 
   readonly property string pluginDir: (manifest && manifest.__sourceDir)
     ? manifest.__sourceDir
@@ -50,6 +60,7 @@ Item {
 
   function open(payloadJson) {
     root.opened = true
+    root.picking = false
     root.filterText = ""
     root.selectedIndex = 0
     root.cursorActive = true
@@ -65,10 +76,12 @@ Item {
 
   function close() {
     root.opened = false
+    root.picking = false
   }
 
   function dismiss() {
     root.opened = false
+    root.picking = false
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "emiifont.github-search")
   }
@@ -100,6 +113,8 @@ Item {
       root.lastError = msg.error || ""
     } else if (msg.event === "config") {
       root.cloneRoot = msg.cloneRoot || root.cloneRoot
+    } else if (msg.event === "targets") {
+      root.targets = msg.targets || []
     }
   }
 
@@ -135,10 +150,28 @@ Item {
   function activateIndex(index, action) {
     if (index < 0 || index >= displayModel.count) return
     var row = displayModel.get(index)
-    if (action === "clone") root.send({ cmd: "clone", name: row.name })
+    if (action === "clone") { root.beginPick(index); return }
     else if (action === "copy") { root.send({ cmd: "copy", name: row.name }); return }
     else if (action === "pulls") root.send({ cmd: "open", url: row.url + "/pulls" })
     else root.send({ cmd: "open", url: row.url })
+    root.dismiss()
+  }
+
+  // Ctrl+Enter picks which subdirectory of cloneRoot to clone into. With no
+  // subdirectories there is nothing to choose, so it clones into the root.
+  function beginPick(index) {
+    if (index < 0 || index >= displayModel.count) return
+    root.send({ cmd: "targets" })
+    if (!root.targets || root.targets.length === 0) { root.doClone(index, ""); return }
+    root.pendingIndex = index
+    root.pickIndex = 0
+    root.picking = true
+  }
+
+  function doClone(index, into) {
+    if (index < 0 || index >= displayModel.count) return
+    root.send({ cmd: "clone", name: displayModel.get(index).name, into: into })
+    root.picking = false
     root.dismiss()
   }
 
@@ -202,6 +235,22 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
+          if (root.picking) {
+            var n = root.targets.length
+            if (event.key === Qt.Key_Escape) {
+              root.picking = false
+            } else if (event.key === Qt.Key_Up) {
+              root.pickIndex = (root.pickIndex - 1 + n) % n
+            } else if (event.key === Qt.Key_Down) {
+              root.pickIndex = (root.pickIndex + 1) % n
+            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              root.doClone(root.pendingIndex, root.targets[root.pickIndex])
+            } else if (event.text >= "1" && event.text <= "9" && parseInt(event.text) <= n) {
+              root.doClone(root.pendingIndex, root.targets[parseInt(event.text) - 1])
+            }
+            event.accepted = true
+            return
+          }
           if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
             else root.dismiss()
@@ -362,10 +411,81 @@ Item {
             }
           }
 
+          Rectangle {
+            anchors.fill: parent
+            color: root.background
+            visible: root.picking
+            z: 10
+
+            Column {
+              anchors.centerIn: parent
+              width: parent.width
+              spacing: Style.spacing.md
+
+              Text {
+                width: parent.width
+                text: root.picking && root.pendingIndex >= 0 && root.pendingIndex < displayModel.count
+                  ? "Clone " + displayModel.get(root.pendingIndex).name + " into…"
+                  : "Clone into…"
+                color: root.foreground
+                opacity: 0.7
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideMiddle
+              }
+
+              Repeater {
+                model: root.targets
+
+                Rectangle {
+                  required property int index
+                  required property string modelData
+
+                  width: parent.width
+                  height: Style.font.title + Style.spacing.controlPaddingY * 2
+                  radius: root.cornerRadius
+                  color: index === root.pickIndex ? root.selectedBackground : "transparent"
+
+                  Text {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.spacing.rowPaddingX
+                    anchors.rightMargin: Style.spacing.rowPaddingX
+                    verticalAlignment: Text.AlignVCenter
+                    horizontalAlignment: Text.AlignHCenter
+                    text: (index + 1) + "  \uf07b  " + root.cloneRoot.replace(root.homePath, "~") + "/" + modelData
+                    color: index === root.pickIndex ? root.selectedText : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.title
+                    elide: Text.ElideMiddle
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onContainsMouseChanged: if (containsMouse) root.pickIndex = index
+                    onClicked: root.doClone(root.pendingIndex, modelData)
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                text: "↵ or 1–9 clone here · esc cancel"
+                color: root.foreground
+                opacity: 0.45
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignHCenter
+              }
+            }
+          }
+
           Column {
             anchors.centerIn: parent
             spacing: Style.space(8)
-            visible: displayModel.count === 0
+            visible: displayModel.count === 0 && !root.picking
 
             Text {
               text: root.refreshing && !root.everLoaded ? "󰑓" : "\uf09b"
@@ -400,7 +520,7 @@ Item {
         Text {
           width: parent.width
           height: root.footerHeight
-          text: "↵ open · ⌥↵ PRs · ⌃↵ clone → " + root.cloneRoot.replace(root.homePath, "~") + " · ⌃Y SSH · ⌃R refresh"
+          text: "↵ open · ⌥↵ PRs · ⌃↵ clone into " + root.cloneRoot.replace(root.homePath, "~") + "/… · ⌃Y SSH · ⌃R refresh"
           color: root.foreground
           opacity: 0.45
           font.family: root.fontFamily

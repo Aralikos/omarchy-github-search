@@ -7,10 +7,12 @@ JSON-lines over stdin/stdout:
   stdin  <- {"cmd": "filter", "query": "..."}
   stdin  <- {"cmd": "refresh", "force": true|false}
   stdin  <- {"cmd": "open", "url": "https://..."}
-  stdin  <- {"cmd": "clone", "name": "owner/repo"}
+  stdin  <- {"cmd": "clone", "name": "owner/repo", "into": "personal"}
+  stdin  <- {"cmd": "targets"}
   stdin  <- {"cmd": "copy", "name": "owner/repo"}
 
-  stdout -> {"event": "config", "cloneRoot": "/home/user/Development/github"}
+  stdout -> {"event": "config", "cloneRoot": "/home/user/Work"}
+  stdout -> {"event": "targets", "targets": ["inforama", "personal", "tries"]}
   stdout -> {"event": "status", "refreshing": bool, "count": N, "error": ""}
   stdout -> {"event": "rows", "query": "...", "rows": [{name, desc, url, priv, cloned}]}
 
@@ -18,6 +20,12 @@ Status errors: "" (none), "gh-missing", "gh-auth", "fetch-failed".
 
 The helper exits when stdin closes, so it never outlives the shell overlay.
 Only the Python standard library is used.
+
+LOCAL PATCH (Knowledge_OS, 2026-09-06): cloneRoot is a *parent* of project
+directories here, not a flat repo dump. `targets` lists its immediate
+subdirectories and `clone` takes an `into` naming one of them, so Ctrl+Enter
+picks a destination instead of always using the root. Reverted by
+`omarchy plugin update` — see APPARATUS/configs/omarchy-github-search.md.
 """
 
 import json
@@ -232,11 +240,34 @@ def filter_repos(repos, query):
     return [item for _, _, item in scored[:MAX_ROWS]]
 
 
-def cloned_dirs():
+def clone_targets():
+    """Immediate subdirectories of cloneRoot: the destinations Ctrl+Enter offers."""
+    root = clone_root()
     try:
-        return set(os.listdir(clone_root()))
+        names = os.listdir(root)
+    except OSError:
+        return []
+    return sorted(
+        n for n in names
+        if not n.startswith(".") and os.path.isdir(os.path.join(root, n))
+    )
+
+
+def cloned_dirs():
+    """Repo directory names already present, in cloneRoot and one level under
+    it — the badge has to see ~/Work/personal/foo, not just ~/Work/foo."""
+    root = clone_root()
+    try:
+        top = os.listdir(root)
     except OSError:
         return set()
+    have = set(top)
+    for target in clone_targets():
+        try:
+            have.update(os.listdir(os.path.join(root, target)))
+        except OSError:
+            continue
+    return have
 
 
 def emit_rows(query):
@@ -292,8 +323,10 @@ def run_clone(source, dest, env):
     return False, detail[-1] if detail else "unknown error"
 
 
-def clone(full_name):
-    dest = os.path.join(clone_root(), full_name.split("/")[-1])
+def clone(full_name, into=""):
+    root = clone_root()
+    parent = os.path.join(root, into) if into in clone_targets() else root
+    dest = os.path.join(parent, full_name.split("/")[-1])
     if os.path.exists(dest):
         notify("Already cloned: " + dest)
         return
@@ -338,6 +371,7 @@ def main():
     global _last_query
 
     emit({"event": "config", "cloneRoot": clone_root()})
+    emit({"event": "targets", "targets": clone_targets()})
     _repos[:] = load_cache()
     emit_rows("")
     spawn(refresh)
@@ -358,10 +392,12 @@ def main():
             spawn(refresh, msg.get("force") is True)
         elif cmd == "open":
             open_url(str(msg.get("url") or ""))
+        elif cmd == "targets":
+            emit({"event": "targets", "targets": clone_targets()})
         elif cmd == "clone":
             name = str(msg.get("name") or "")
             if valid_repo_name(name):
-                spawn(clone, name)
+                spawn(clone, name, str(msg.get("into") or ""))
         elif cmd == "copy":
             name = str(msg.get("name") or "")
             if valid_repo_name(name):
